@@ -15,15 +15,19 @@ class ActorCritic(nn.Module):
     def __init__(self):
         super(ActorCritic, self).__init__()
 
-        self.shared_net = nn.Sequential(
-                nn.Linear(4, 8),
-                nn.ReLU(),
-                nn.Linear(8, 8),
-                nn.ReLU()
-                )
+        self.actor = nn.Sequential(
+                nn.Linear(4, 64),
+                nn.Tanh(),
+                nn.Linear(64, 64),
+                nn.Tanh(),
+                nn.Linear(64, 2))
 
-        self.actor = nn.Sequential(self.shared_net, nn.Linear(8, 2))
-        self.critic = nn.Sequential(self.shared_net, nn.Linear(8, 1))
+        self.critic = nn.Sequential(
+                nn.Linear(4, 64),
+                nn.Tanh(),
+                nn.Linear(64, 64),
+                nn.Tanh(),
+                nn.Linear(64, 1))
 
     def action(self, x):
         x = self.actor(x)
@@ -48,13 +52,11 @@ if __name__ == "__main__":
     policy = ActorCritic()
     policy.to(device)
 
-    print("test")
-
     env = gym.make("CartPole-v1")
     observation = env.reset()
     # collect rollout
-    max_timesteps = 512
-    rollout_timesteps = 512
+    max_timesteps = 20000
+    rollout_timesteps = 2048
     total_timesteps = 0
     while(total_timesteps < max_timesteps):
         # collect some data
@@ -64,9 +66,11 @@ if __name__ == "__main__":
         action_probs = []
         values = []
         gaes = []
+        dones = []
 
         for _ in range(rollout_timesteps):
             total_timesteps += 1
+            policy.eval()
             with torch.no_grad():
                 action_logits, action_sample, action_log_prob, _, value = policy(torch.from_numpy(observation).to(device))
 
@@ -79,21 +83,32 @@ if __name__ == "__main__":
             observation, reward, done, info = env.step(act)
 
             rewards.append(torch.from_numpy(np.array(reward)))
+            dones.append(done)
 
             if done:
                 observation = env.reset()
 
+        _, _, _, _, value = policy(torch.from_numpy(observation).to(device))
+        values.append(value)
+
         # compute advantage estimates
         gamma = 0.9
-        lambd = 1.0
-        gae = 0.0
-        for i in reversed(range(rollout_timesteps - 1)):
-            delta = rewards[i] + gamma * values[i + 1] - values[i]
-            gae += np.power(gamma * lambd, rollout_timesteps - i + 1) * delta
-            # print(f"gae={gae}")
-            gaes.append(gae)
+        gae_lambda = 1.0
 
-        gaes.reverse()
+        gae = 0
+
+        for i in reversed(range(len(rewards))):
+            done_factor = 1.0
+            if dones[i]:
+                done_factor = 0.0
+
+            temp = gamma * values[i + 1] * done_factor - rewards[i]
+            delta = rewards[i] + temp
+            gae = delta + gamma * gae_lambda * done_factor * gae
+            gaes.append(gae)
+        gaes = gaes[::-1]
+
+
         # print(f"gaes={gaes}")
         # print(f"values={values}")
 
@@ -106,34 +121,46 @@ if __name__ == "__main__":
         action_probs = torch.squeeze(torch.stack(action_probs)).detach().to(device)
         rewards = torch.squeeze(torch.stack(rewards)).detach().to(device)
         gaes = torch.squeeze(torch.stack(gaes)).detach().to(device)
-        print(f"observations={observations}")
+
+        # print(f"observations={observations}")
+        # print(f"actions={actions}")
         print(f"Timesteps: {total_timesteps}")
-        optimizer = optim.Adam(policy.parameters(), lr=0.0003)
+        # optimizer = optim.Adam(policy.parameters(), lr=0.001)
+        optimizer = optim.Adam([
+            {'params': policy.actor.parameters(), 'lr': 0.0003},
+            {'params': policy.critic.parameters(), 'lr': 0.001}])
         epsilon = 0.2
         for _ in range(10):
-            for obs, action, old_probs, reward, advantage in zip(observations, actions, action_probs, rewards, gaes):
-                _, _, new_probs, action_dist, value = policy(obs.to(device))
-                entropy = action_dist.entropy().mean()
+            optimizer.zero_grad()
+            policy.train()
+            _, _, new_probs, action_dist, value = policy(observations)
+            # print(f"new_probs={new_probs}")
+            entropy = action_dist.entropy().mean()
 
-                ratio = (new_probs - old_probs).exp()
-                # print(f"ratio={ratio}")
-                surrogate1 = ratio * advantage
-                surrogate2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantage
+            ratio = (new_probs - action_probs).exp()
+            # print(f"ratio={ratio}")
+            # gaes = rewards - value.detach()
+            # gaes = rewards2 - value.detach()
+            surrogate1 = ratio * gaes
+            surrogate2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * gaes
 
-                actor_loss = - torch.min(surrogate1, surrogate2).mean()
-                critic_loss = (reward - value).pow(2).mean()
+            actor_loss = - torch.min(surrogate1, surrogate2).mean()
+            critic_loss = (reward - value).pow(2).mean()
 
-                loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
+            loss = 0.5 * critic_loss + actor_loss - 0.001 * entropy
 
-                # print(f"loss={loss}")
+            # print(f"critic_loss={critic_loss}")
+            # print(f"actor_loss={actor_loss}")
+            # print(f"loss={loss}")
+            # print(f"entropy={entropy}")
+            # print(f"value={value}")
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
     ep_reward = 0.0
     # eval or something
-    for _ in range(200):
+    for _ in range(2000):
         env.render()
         # print(f"{policy(torch.from_numpy(observation))}")
         action_logits, action_sample, action_log_prob, _, value = policy(torch.from_numpy(observation).to(device))
@@ -142,8 +169,12 @@ if __name__ == "__main__":
         # print(f"action_log_prob={action_log_prob}")
         # print(f"act={action}")
         # print(f"value={value}")
-
-        act = np.argmax(action_logits.detach().cpu().numpy())
+        # print(f"action_logits={action_logits}")
+        # act = F.softmax(action_logits.detach().cpu().numpy())
+        act = F.softmax(action_logits)
+        # print(f"act probs={act}")
+        act = np.argmax(act.detach().cpu().numpy())
+        # print(f"act={act}")
         observation, reward, done, info = env.step(act)
         ep_reward += reward
 
